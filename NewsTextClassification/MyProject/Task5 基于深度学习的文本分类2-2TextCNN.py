@@ -25,13 +25,14 @@ logging.info("Use cuda: %s, gpu id: %d.", use_cuda, gpu)
 
 # split data to 10 fold
 fold_num = 10
-data_file = './data/sample_train.csv'
+# data_file = './data/sample_train.csv'
+data_file = r'E:\deeplearning_data\NewsTextClassification_Data\train_set.csv'
 import pandas as pd
 
 # 切分数据到10折
 def all_data2fold(fold_num, num=10000):
     fold_data = []
-    f = pd.read_csv(data_file,encoding='UTF-8')
+    f = pd.read_csv(data_file, sep='\t',encoding='UTF-8')
     texts = f['text'].tolist()[:num]
     labels = f['label'].tolist()[:num]
     total = len(labels)
@@ -117,8 +118,9 @@ for i in range(0, fold_id):
 train_data = {'label': train_labels, 'text': train_texts}
 
 # test
-test_data_file = './data/sample_test.csv'
-f = pd.read_csv(test_data_file,encoding='UTF-8')
+# test_data_file = './data/sample_test.csv'
+test_data_file = r'E:\deeplearning_data\NewsTextClassification_Data\test_a.csv'
+f = pd.read_csv(test_data_file, sep='\t', encoding='UTF-8')
 texts = f['text'].tolist()
 test_data = {'label': [0] * len(texts), 'text': texts}
 
@@ -419,3 +421,331 @@ class Model(nn.Module):
 
 model = Model(vocab)
 
+
+# build optimizer
+learning_rate = 2e-4
+decay = .75
+decay_step = 1000
+
+class Optimizer:
+    def __init__(self, model_parameters):
+        self.all_params = []
+        self.optims = []
+        self.schedulers = []
+
+        for name, parameters in model_parameters.items():
+            if name.startswith("basic"):
+                optim = torch.optim.Adam(parameters, lr=learning_rate)
+                self.optims.append(optim)
+                # 这里的公式，我有点没懂其背后的原因
+                l = lambda step: decay ** (step // decay_step)
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=l)
+                self.schedulers.append(scheduler)
+                self.all_params.extend(parameters)
+                # schedulers 在这里的作用是啥？
+                """
+                loss.backward()在前，然后跟一个parameters.step()。
+                loss.backward():  计算梯度
+                optimizer.step ：是更新梯度
+                scheduler.step（）按照Pytorch的定义是用来更新优化器的学习率的，
+                一般是按照epoch为单位进行更换，即多少个epoch后更换一次学习率，因而scheduler.step()放在epoch这个大循环下。
+                """
+            else:
+                Exception("no nameed parameters.")
+        self.num = len(self.optims)
+
+    def step(self):
+        for optim, scheduler in zip(self.optims, self.schedulers):
+            optim.step()
+            scheduler.step()
+            optim.zero_grad()  
+            """
+            step这个函数使用的是参数空间(param_groups)中的grad,也就是当前参数空间对应的梯度，
+            这也就解释了为什么optimzier使用之前需要zero清零一下，
+            因为如果不清零，那么使用的这个grad就得同上一个mini-batch有关，这不是我们需要的结果。
+            """
+
+    def zero_grad(self):
+        for optim in self.optims:
+            optim.zero_grad()
+
+    def get_lr(self):
+        lrs = tuple(map(lambda x: x.get_lr()[-1], self.schedulers))
+        lr = ' %.5f' * self.num  #学习率，是在逐渐变大的吗？
+        res = lr % lrs
+        return res
+
+
+# build dataset
+def sentence_split(text, vocab, max_sent_len=256, max_segment=16):
+    words = text.strip().split()
+    document_len = len(words) #文章长度 等于 单词个数，那句子长度怎么来的？
+    index = list(range(0, document_len, max_sent_len))
+    index.append(document_len) # 如 list(range(0, 10, 3)) = [0, 3, 6, 9], 再append最后一个长度
+
+    segments = []
+    for i in range(len(index) - 1):
+        segment = words[index[i]: index[i + 1]]
+        assert len(segment) > 0
+        segment = [word if word in vocab._id2word else '<UNK>' for word in segment]
+        segments.append([len(segment), segment])
+    # 巧妙的转换长度方式
+    assert len(segments) > 0
+    if len(segments) > max_segment:
+        segment_ = int(max_segment / 2)
+        return segments[:segment_] + segments[-segment_:]
+    else:
+        return segments
+
+def get_examples(data, vocab, max_sent_len=256, max_segment=8):
+    label2id = vocab.label2id
+    examples = []
+
+    for text, label in zip(data['text'], data['label']):
+        # label
+        id = label2id(label)
+        # words
+        sents_words = sentence_split(text, vocab, max_sent_len, max_segment) # [[句子长度，句子的单词编码]，，]
+        doc = []
+        for sent_len, sent_words in sents_words:
+            word_ids = vocab.word2id(sent_words) # 单词编码转为 id 编码
+            extword_ids = vocab.extword2id(sent_words)
+            doc.append([sent_len, word_ids, extword_ids])
+        examples.append([id, len(doc), doc])
+
+    logging.info('Total %d docs.' % len(examples))
+    return examples
+
+
+# build loader
+def batch_slice(data, batch_size):
+    batch_num = int(np.ceil(len(data) / float(batch_size)))
+    for i in range(batch_num):
+        cur_batch_size = batch_size if i < batch_num - 1 else len(data) - batch_size * i
+        docs = [data[i * batch_size + b] for b in range(cur_batch_size)]
+        yield docs
+
+def data_iter(data, batch_size, shuffle=True, noise=1.0):
+    """
+    randomly permute data, then sort by source length, and partition into batches
+    ensure that the length of  sentences in each batch
+    """
+    batched_data = []
+    if shuffle:
+        np.random.shuffle(data)
+        lengths = [example[1] for example in data]
+        noisy_lengths = [- (l + np.random.uniform(- noise, noise)) for l in lengths]
+        sorted_indices = np.argsort(noisy_lengths).tolist()
+        sorted_data = [data[i] for i in sorted_indices]
+    else:
+        sorted_data = data
+    batched_data.extend(list(batch_slice(sorted_data, batch_size)))
+    if shuffle:
+        np.random.shuffle(batched_data)
+    for batch in batched_data:
+        yield batch
+
+
+# some function
+from sklearn.metrics import f1_score, precision_score, recall_score
+def get_score(y_ture, y_pred):
+    y_ture = np.array(y_ture)
+    y_pred = np.array(y_pred)
+    f1 = f1_score(y_ture, y_pred, average='macro', zero_division=0) * 100
+    p = precision_score(y_ture, y_pred, average='macro',zero_division=0) * 100
+    r = recall_score(y_ture, y_pred, average='macro',zero_division=0) * 100
+    return str((reformat(p, 2), reformat(r, 2), reformat(f1, 2))), reformat(f1, 2)
+def reformat(num, n):
+    return float(format(num, '0.' + str(n) + 'f'))
+
+
+
+# build trainer
+import time
+from sklearn.metrics import classification_report
+
+clip = 5.0
+epochs = 1
+early_stops = 3
+log_interval = 50
+test_batch_size = 128
+train_batch_size = 128
+save_model = './cnn.bin'
+save_test = './cnn.csv'
+
+class Trainer():
+    def __init__(self, model, vocab):
+        self.model = model
+        self.report = True
+        self.train_data = get_examples(train_data, vocab)
+        self.batch_num = int(np.ceil(len(self.train_data) / float(train_batch_size)))
+        self.dev_data = get_examples(dev_data, vocab)
+        self.test_data = get_examples(test_data, vocab)
+        # criterion
+        self.criterion = nn.CrossEntropyLoss()
+        # label name
+        self.target_names = vocab.target_names  #标签对应名称
+        # optimizer
+        self.optimizer = Optimizer(model.all_parameters)
+        # count
+        self.step = 0
+        self.early_stop = -1
+        self.best_train_f1, self.best_dev_f1 = 0, 0
+        self.last_epoch = epochs
+
+    def train(self):
+        logging.info('Start training...')
+        for epoch in range(1, epochs + 1):
+            train_f1 = self._train(epoch)
+            dev_f1 = self._eval(epoch)
+            if self.best_dev_f1 <= dev_f1:
+                logging.info(
+                    "Exceed history dev = %.2f, current dev = %.2f" % (self.best_dev_f1, dev_f1))
+                torch.save(self.model.state_dict(), save_model)
+                self.best_train_f1 = train_f1
+                self.best_dev_f1 = dev_f1
+                self.early_stop = 0
+            else:
+                self.early_stop += 1
+                if self.early_stop == early_stops: # early_stops = 3
+                    logging.info(
+                        "Eearly stop in epoch %d, best train: %.2f, dev: %.2f" % (
+                            epoch - early_stops, self.best_train_f1, self.best_dev_f1))
+                    self.last_epoch = epoch
+                    break
+
+    def test(self):
+        self.model.load_state_dict(torch.load(save_model))
+        self._eval(self.last_epoch + 1, test=True)
+    
+    def _train(self, epoch):
+        self.optimizer.zero_grad()
+        self.model.train()
+        start_time = time.time()
+        epoch_start_time = time.time()
+        overall_losses = 0
+        losses = 0
+        batch_idx = 1
+        y_pred = []
+        y_true = []
+        for batch_data in data_iter(self.train_data, train_batch_size, shuffle=True):
+            torch.cuda.empty_cache()
+            batch_inputs, batch_labels = self.batch2tensor(batch_data)
+            batch_outputs = self.model(batch_inputs)
+            loss = self.criterion(batch_outputs, batch_labels)
+            loss.backward()
+            """
+            这里的 .cpu().numpy().tolist() 写法，什么意思？
+            out是device：CUDA得到的CUDA tensor。关于detach()的官方文档如下：
+                Returns a new Tensor, detached from the current graph.
+                The result will never require gradient.
+                返回一个new Tensor，只不过不再有梯度。
+            如果想把CUDA tensor格式的数据改成numpy时，需要先将其转换成cpu float-tensor随后再转到numpy格式。 
+            numpy不能读取CUDA tensor 需要将它转化为 CPU tensor
+            所以得写成.cpu().numpy()
+            """
+            loss_value = loss.detach().cpu().item()
+            losses += loss_value
+            overall_losses += loss_value
+            y_pred.extend(torch.max(batch_outputs, dim=1)[1].cpu().numpy().tolist())
+            y_true.extend(batch_labels.cpu().numpy().tolist())
+            nn.utils.clip_grad_norm_(self.optimizer.all_params, max_norm=clip)  #clip = 5
+            # nn.utils.clip_grad_norm_ ：Returns:参数的总体范数（作为单个向量来看）
+            for optimizer, scheduler in zip(self.optimizer.optims, self.optimizer.schedulers):
+                optimizer.step()
+                scheduler.step()
+            self.optimizer.zero_grad()  #这里放在循环外面吗？
+            self.step += 1
+            if batch_idx % log_interval == 0:
+                elapsed = time.time() - start_time
+                lrs = self.optimizer.get_lr()
+                logging.info(
+                    '| epoch {:3d} | step {:3d} | batch {:3d}/{:3d} | lr{} | loss {:.4f} | s/batch {:.2f}'.format(
+                        epoch, self.step, batch_idx, self.batch_num, lrs,
+                        losses / log_interval,
+                        elapsed / log_interval))
+                losses = 0
+                start_time = time.time()
+            batch_idx += 1
+        overall_losses /= self.batch_num
+        during_time = time.time() - epoch_start_time
+        # reformat
+        overall_losses = reformat(overall_losses, 4)
+        score, f1 = get_score(y_true, y_pred)
+        logging.info(
+            '| epoch {:3d} | score {} | f1 {} | loss {:.4f} | time {:.2f}'.format(epoch, score, f1,
+                                                                                  overall_losses,
+                                                                                  during_time))
+        if set(y_true) == set(y_pred) and self.report:
+            report = classification_report(y_true, y_pred, digits=4, target_names=self.target_names)
+            logging.info('\n' + report)
+        return f1
+
+    def _eval(self, epoch, test=False):
+        self.model.eval()
+        start_time = time.time()
+        data = self.test_data if test else self.dev_data
+        y_pred = []
+        y_true = []
+        with torch.no_grad():
+            for batch_data in data_iter(data, test_batch_size, shuffle=False):
+                torch.cuda.empty_cache()
+                batch_inputs, batch_labels = self.batch2tensor(batch_data)
+                batch_outputs = self.model(batch_inputs)
+                y_pred.extend(torch.max(batch_outputs, dim=1)[1].cpu().numpy().tolist())
+                y_true.extend(batch_labels.cpu().numpy().tolist())
+            score, f1 = get_score(y_true, y_pred)
+            during_time = time.time() - start_time
+            if test:
+                df = pd.DataFrame({'label': y_pred})
+                df.to_csv(save_test, index=False, sep=',')
+            else:
+                logging.info(
+                    '| epoch {:3d} | dev | score {} | f1 {} | time {:.2f}'.format(epoch, score, f1,
+                                                                              during_time))
+                if set(y_true) == set(y_pred) and self.report:
+                    report = classification_report(y_true, y_pred, digits=4, target_names=self.target_names)
+                    logging.info('\n' + report)
+        return f1
+
+    def batch2tensor(self, batch_data): # 列表转tensor
+        '''
+            [[label, doc_len, [[sent_len, [sent_id0, ...], [sent_id1, ...]], ...]]
+        '''
+        batch_size = len(batch_data)
+        doc_labels = []
+        doc_lens = []
+        doc_max_sent_len = []
+        for doc_data in batch_data:
+            doc_labels.append(doc_data[0])
+            doc_lens.append(doc_data[1])
+            sent_lens = [sent_data[0] for sent_data in doc_data[2]]
+            max_sent_len = max(sent_lens)
+            doc_max_sent_len.append(max_sent_len)
+        max_doc_len = max(doc_lens)
+        max_sent_len = max(doc_max_sent_len)
+        batch_inputs1 = torch.zeros((batch_size, max_doc_len, max_sent_len), dtype=torch.int64)
+        batch_inputs2 = torch.zeros((batch_size, max_doc_len, max_sent_len), dtype=torch.int64)
+        batch_masks = torch.zeros((batch_size, max_doc_len, max_sent_len), dtype=torch.float32)
+        batch_labels = torch.LongTensor(doc_labels)
+        # 这里的‘填充’有更好的方法嘛？
+        for b in range(batch_size):
+            for sent_idx in range(doc_lens[b]):
+                sent_data = batch_data[b][2][sent_idx]
+                for word_idx in range(sent_data[0]):
+                    batch_inputs1[b, sent_idx, word_idx] = sent_data[1][word_idx]
+                    batch_inputs2[b, sent_idx, word_idx] = sent_data[2][word_idx]
+                    batch_masks[b, sent_idx, word_idx] = 1
+        if use_cuda:
+            batch_inputs1 = batch_inputs1.to(device)
+            batch_inputs2 = batch_inputs2.to(device)
+            batch_masks = batch_masks.to(device)
+            batch_labels = batch_labels.to(device)
+        return (batch_inputs1, batch_inputs2, batch_masks), batch_labels
+
+# train
+trainer = Trainer(model, vocab)
+trainer.train()
+
+# test
+trainer.test()
