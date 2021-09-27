@@ -280,9 +280,9 @@ class Attention(nn.Module):
         return batch_outputs, attn_scores
     
 # build word encoder
-bert_path = '../Mycodes/data/bert/bert-mini/'
+# bert_path =  r'D:\\MyData\\chenpf8\\team-learning-nlp\\NewsTextClassification\\Mycodes\\data\\bert\\bert-mini\\'
+bert_path = "../Mycodes/data/bert/bert-mini/"
 dropout = 0.15
-
 
 from transformers import BertModel
 class WordBertEncoder(nn.Module):
@@ -312,7 +312,11 @@ class WordBertEncoder(nn.Module):
         # input_ids: sen_num x bert_len
         # token_type_ids: sen_num  x bert_len
         # sen_num x bert_len x 256, sen_num x 256
-        sequence_output, pooled_output = self.bert(input_ids=input_ids, token_type_ids=token_type_ids)
+
+        # transformers 的版本问题
+        # sequence_output, pooled_output = self.bert(input_ids=input_ids, token_type_ids=token_type_ids)
+        output = self.bert(input_ids=input_ids, token_type_ids=token_type_ids) 
+        sequence_output, pooled_output = output[0], output[1]
         if self.pooled:
             reps = pooled_output
         else:
@@ -389,14 +393,14 @@ class SentEncoder(nn.Module):
 class Model(nn.Module):
     def __init__(self, vocab):
         super(Model, self).__init__()
-        self.sent_rep_size = 300
+        self.sent_rep_size = 256
         self.doc_rep_size = sent_hidden_size * 2  # sent_hidden_size =256
         self.all_parameters = {}
         parameters = []
-        self.word_encoder = WordCNNEncoder(vocab)  #CNNtext编码后的向量
+        self.word_encoder = WordBertEncoder()  #BertText编码后的向量
         # 满足参数梯度 = True 的，就选出来放到 parameters 里面去。
         # parameters ： nn.Module自带的属性
-        parameters.extend(list(filter(lambda p: p.requires_grad, self.word_encoder.parameters())))
+        bert_parameters = self.word_encoder.get_bert_parameters()
 
         self.sent_encoder = SentEncoder(self.sent_rep_size)  #返回隐藏层状态
         self.sent_attention = Attention(self.doc_rep_size) # 返回 batch_outputs, attn_scores
@@ -409,6 +413,7 @@ class Model(nn.Module):
             self.to(device)
         if len(parameters) > 0:
             self.all_parameters["basic_parameters"] = parameters
+        self.all_parameters["bert_parameters"] = bert_parameters
         logging.info('Build model with cnn word encoder, lstm sent encoder.')
         # numpy.prod()这个函数是连乘操作，将里面所有的元素相乘
         para_num = sum([np.prod(list(p.size())) for p in self.parameters()])
@@ -430,8 +435,9 @@ class Model(nn.Module):
 
         sent_reps = sent_reps.view(batch_size, max_doc_len, self.sent_rep_size)  # b x doc_len x sent_rep_size
         batch_masks = batch_masks.view(batch_size, max_doc_len, max_sent_len)  # b x doc_len x max_sent_len
-        sent_masks = batch_masks.bool().any(2).float()  # b x doc_len
 
+        sent_masks = batch_masks.bool().any(2).float()  # b x doc_len
+        
         sent_hiddens = self.sent_encoder(sent_reps, sent_masks)  # b x doc_len x doc_rep_size
         doc_reps, atten_scores = self.sent_attention(sent_hiddens, sent_masks)  # b x doc_rep_size
 
@@ -445,11 +451,13 @@ model = Model(vocab)
 
 # build optimizer
 learning_rate = 2e-4
+bert_lr = 5e-5
 decay = .75
 decay_step = 1000
+from transformers import AdamW, get_linear_schedule_with_warmup
 
 class Optimizer:
-    def __init__(self, model_parameters):
+    def __init__(self, model_parameters,steps):
         self.all_params = []
         self.optims = []
         self.schedulers = []
@@ -471,6 +479,14 @@ class Optimizer:
                 scheduler.step（）按照Pytorch的定义是用来更新优化器的学习率的，
                 一般是按照epoch为单位进行更换，即多少个epoch后更换一次学习率，因而scheduler.step()放在epoch这个大循环下。
                 """
+            elif name.startswith("bert"):
+                optim_bert = AdamW(parameters, bert_lr, eps=1e-8)
+                self.optims.append(optim_bert)
+                scheduler_bert = get_linear_schedule_with_warmup(optim_bert, 0, steps)
+                self.schedulers.append(scheduler_bert)
+                for group in parameters:
+                    for p in group['params']:
+                        self.all_params.append(p)
             else:
                 Exception("no nameed parameters.")
         self.num = len(self.optims)
@@ -500,9 +516,10 @@ class Optimizer:
 # build dataset
 def sentence_split(text, vocab, max_sent_len=256, max_segment=16):
     words = text.strip().split()
-    document_len = len(words) #文章长度 等于 单词个数，那句子长度怎么来的？
+    document_len = len(words)
+
     index = list(range(0, document_len, max_sent_len))
-    index.append(document_len) # 如 list(range(0, 10, 3)) = [0, 3, 6, 9], 再append最后一个长度
+    index.append(document_len)
 
     segments = []
     for i in range(len(index) - 1):
@@ -510,7 +527,7 @@ def sentence_split(text, vocab, max_sent_len=256, max_segment=16):
         assert len(segment) > 0
         segment = [word if word in vocab._id2word else '<UNK>' for word in segment]
         segments.append([len(segment), segment])
-    # 巧妙的转换长度方式
+
     assert len(segments) > 0
     if len(segments) > max_segment:
         segment_ = int(max_segment / 2)
@@ -518,20 +535,22 @@ def sentence_split(text, vocab, max_sent_len=256, max_segment=16):
     else:
         return segments
 
-def get_examples(data, vocab, max_sent_len=256, max_segment=8):
+def get_examples(data, word_encoder, vocab, max_sent_len=256, max_segment=8):
     label2id = vocab.label2id
     examples = []
 
     for text, label in zip(data['text'], data['label']):
         # label
         id = label2id(label)
+
         # words
-        sents_words = sentence_split(text, vocab, max_sent_len, max_segment) # [[句子长度，句子的单词编码]，，]
+        sents_words = sentence_split(text, vocab, max_sent_len-2, max_segment)
         doc = []
         for sent_len, sent_words in sents_words:
-            word_ids = vocab.word2id(sent_words) # 单词编码转为 id 编码
-            extword_ids = vocab.extword2id(sent_words)
-            doc.append([sent_len, word_ids, extword_ids])
+            token_ids = word_encoder.encode(sent_words)
+            sent_len = len(token_ids)
+            token_type_ids = [0] * sent_len
+            doc.append([sent_len, token_ids, token_type_ids])
         examples.append([id, len(doc), doc])
 
     logging.info('Total %d docs.' % len(examples))
@@ -589,25 +608,25 @@ clip = 5.0
 epochs = 1
 early_stops = 3
 log_interval = 50
-test_batch_size = 128
-train_batch_size = 128
-save_model = './cnn.bin'
-save_test = './cnn.csv'
+test_batch_size = 16
+train_batch_size = 16
+save_model = './bert.bin'
+save_test = './bert.csv'
 
 class Trainer():
     def __init__(self, model, vocab):
         self.model = model
         self.report = True
-        self.train_data = get_examples(train_data, vocab)
+        self.train_data = get_examples(train_data, model.word_encoder, vocab)
         self.batch_num = int(np.ceil(len(self.train_data) / float(train_batch_size)))
-        self.dev_data = get_examples(dev_data, vocab)
-        self.test_data = get_examples(test_data, vocab)
+        self.dev_data = get_examples(dev_data, model.word_encoder, vocab)
+        self.test_data = get_examples(test_data, model.word_encoder, vocab)
         # criterion
         self.criterion = nn.CrossEntropyLoss()
         # label name
         self.target_names = vocab.target_names  #标签对应名称
         # optimizer
-        self.optimizer = Optimizer(model.all_parameters)
+        self.optimizer = Optimizer(model.all_parameters, steps=self.batch_num * epochs)
         # count
         self.step = 0
         self.early_stop = -1
@@ -770,3 +789,9 @@ trainer.train()
 
 # test
 trainer.test()
+
+"""
+跑出来的结果：
+2021-09-27 16:22:42,319 INFO: | epoch   1 | dev | score (77.81, 73.77, 74.78) | f1 74.78 | time 256.22
+2021-09-27 16:22:42,320 INFO: Exceed history dev = 0.00, current dev = 74.78
+"""
